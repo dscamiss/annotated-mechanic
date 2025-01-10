@@ -1,7 +1,12 @@
+"""Main module for mechanic."""
+
 import logging
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 import torch
+
+# flake8: noqa=D402
+# pylint: disable=too-few-public-methods
 
 
 def _init_state(
@@ -16,7 +21,7 @@ def _init_state(
     force=False,
 ):
     """
-    initialized extra state for mechanic.
+    Initialize extra state for mechanic.
 
     Args:
         optimizer: optimizer instance to initialize extra state for.
@@ -52,7 +57,7 @@ def _init_reference(
     store_delta: bool,
 ):
     """
-    Stores the starting point of the optimization (the "reference").
+    Store the starting point of the optimization (the "reference").
 
     Args:
         optimizer: optimizer instance to store reference for.
@@ -78,10 +83,10 @@ def _step(
     eps: float,
     store_delta: bool = True,
     log_every: int = 0,
-    closure: Callable = None,
+    closure: Optional[Callable[[], float]] = None,
 ):
     """
-    runs one step of mechanic.
+    Run one step of mechanic.
 
     Args:
         optimizer: mechanic optimizer instance that we are computing the step for.
@@ -92,11 +97,13 @@ def _step(
         eps: small number for numerical precision.
         store_delta: whether to store the offsets between current iterate and reference
             or recompute them on-the-fly.
-        force: if True, reinitialize the state.
+        log_every: how often to log scale values.
+        closure: A closure that reevaluates the model and returns the loss;
+            see PyTorch docs for `torch.optim.Optimizer.step`.
+
     Returns:
         loss value
     """
-
     prev_grad = torch.is_grad_enabled()
 
     # we don't wrap the entire function in @torch.no_grad because
@@ -219,7 +226,7 @@ def _step(
         try:
             if mechanic_state[key].device != device:
                 mechanic_state[key] = mechanic_state[key].to(device)
-        except:
+        except (TypeError, RuntimeError):
             pass
 
     # Run the "tuner" step of Mechanic to compute the new s values.
@@ -264,17 +271,12 @@ def _step(
     return result, log_data
 
 
-# Empty class used so that we can do isinstance(mechanize(SGD), Mechanic)
 class Mechanic:
-    pass
-
-
-def is_mechanized(opt):
-    return isinstance(opt, Mechanic)
+    """Empty class."""
 
 
 def mechanize(
-    Base: Any,
+    base_optimizer_class: Type[torch.optim.Optimizer],
     s_decay: float = 0.01,
     betas: Tuple[float] = (0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999),
     s_init: float = 1e-8,
@@ -284,12 +286,13 @@ def mechanize(
     log_every: int = 0,
 ):
     """
-    Wrap a base optimizer class in a mechanic tuner. The mechanized optimizer
-    is a subclass of the base optimizer class in order to minimize disruption
-    to subsequent code.
+    Wrap a base optimizer class in a mechanic tuner.
+
+    The mechanized optimizer is a subclass of the base optimizer class in order
+    to minimize disruption to subsequent code.
 
     Args:
-        Base: base optimizer class to convert into a mechanic instance (e.g. torch.optim.SGD)
+        base_optimizer_class: base optimizer class to convert into a mechanic instance (e.g. torch.optim.SGD)
         s_decay: how much "weight decay" analog to add (called lambda in the paper).
         betas: list of beta values.
         s_init: initial scale value.
@@ -321,20 +324,37 @@ def mechanize(
     significant enough assumptions about how the optimizer will work that they may do
     incorrect things.
     """
-
     if log_func is None:
         logger = logging.getLogger(__name__)
-        log_func = lambda data: logger.info(
-            f"(iter={data['iter_count']}), s_sum (global scaling): {data['s']}"
-        )
 
-    class Mechanized(Base, Mechanic):
-        """
-        Wraps a base algorithm as a Mechanic instance.
-        """
+        def log_func(log_data: Dict[str, int]):
+            """
+            Log data returned by `_step`.
 
-        def step(self, closure=None):
+            Args:
+                log_data: Dict containing log data.
+            """
+            logger.info(
+                "(iter=%s), s_sum (global scaling): %s",
+                {log_data["iter_count"]},
+                {log_data["s"]},
+            )
 
+    class Mechanized(base_optimizer_class, Mechanic):
+        """Wraps a base algorithm as a Mechanic instance."""
+
+        def step(self, closure: Optional[Callable[[], float]] = None):
+            """
+            Override `base_class.step()`.
+
+            Args:
+                closure: A closure that reevaluates the model and returns the
+                    loss; see PyTorch docs for `torch.optim.Optimizer.step`.
+
+            Returns:
+                - Tensor with loss value, if `closure` is not `None`.
+                - `None`, if `closure` is `None`.
+            """
             result, log_data = _step(
                 self,
                 super().step,
@@ -352,6 +372,6 @@ def mechanize(
 
             return result
 
-    Mechanized.__name__ += Base.__name__
+    Mechanized.__name__ += base_optimizer_class.__name__
 
     return Mechanized
